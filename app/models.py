@@ -1,6 +1,4 @@
 """SQLAlchemy ORM models for the CoWork domain."""
-from datetime import datetime
-
 from sqlalchemy import (
     Column,
     DateTime,
@@ -12,6 +10,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 
 from .database import Base
+from .timeutils import utc_now_naive
 
 
 class Organization(Base):
@@ -30,7 +29,7 @@ class User(Base):
     username = Column(String, nullable=False, index=True)
     hashed_password = Column(String, nullable=False)
     role = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now_naive, nullable=False)
 
 
 class Room(Base):
@@ -54,7 +53,7 @@ class Booking(Base):
     status = Column(String, nullable=False, default="confirmed")
     reference_code = Column(String, nullable=False, index=True)
     price_cents = Column(Integer, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now_naive, nullable=False)
 
     refunds = relationship("RefundLog", backref="booking")
 
@@ -66,4 +65,4 @@ class RefundLog(Base):
     booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False, index=True)
     amount_cents = Column(Integer, nullable=False)
     status = Column(String, nullable=False)
-    processed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    processed_at = Column(DateTime, default=utc_now_naive, nullable=False)

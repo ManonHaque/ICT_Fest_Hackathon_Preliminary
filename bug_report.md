@@ -440,20 +440,149 @@ and what was changed to fix it. Bugs are grouped by severity.
      (`200` with a fresh `access_token`) — no collateral damage.
   **10 PASS, 0 FAIL.**
 
-### #18 — Cosmetic / docs
-*(pending)*
+### #18 — Missing test deps in `requirements.txt` ✅ FIXED
+- **File:** `requirements.txt`
+- **Bug:** README §23–28 documents the local smoke-test flow as
+  `pip install -r requirements.txt; pytest`. `tests/test_smoke.py` uses
+  `fastapi.testclient.TestClient`, which transitively needs `httpx`, plus
+  `pytest` itself. `requirements.txt` shipped without either, so any user
+  following the README got `No module named 'pytest'` /
+  `No module named 'httpx'`. The Dockerfile install path was unaffected
+  because `tests/` isn't copied into the image, but the documented
+  local flow was broken.
+- **Fix:** Appended the test deps with a comment pointing at the README
+  section that requires them.
+  ```diff
+   PyJWT==2.8.0
+  +
+  +# Test deps (used by tests/test_smoke.py per README §23-28's
+  +# "pip install -r requirements.txt; pytest" instructions).
+  +pytest==8.2.2
+  +httpx==0.27.0
+  ```
+- **Verified:** `pip install -r requirements.txt` inside the running
+  container succeeded, and `pytest tests/test_smoke.py -v` reported
+  `1 passed`.
 
 ### #19 — Router prefix drift
-*(pending)*
+*(verified no fix needed — every router file's `prefix=` matches the
+README path table exactly: `auth=/auth`, `rooms=/rooms`,
+`admin=/admin`, `bookings=` with explicit `/bookings/...` paths,
+`health=` with explicit `/health`)*
 
 ### #20 — `seen_ids` cache — already correct
-*(pending — verified no fix needed)*
+*(verified no fix needed — the `seen_ids` set referenced in some docs
+doesn't exist in code; there is no corresponding defect)*
 
-### #21 — Locks held through `time.sleep` in notifications
-*(pending)*
+### #21 — Locks held through `time.sleep` in notifications ✅ FIXED
+- **File:** `app/services/notifications.py`
+- **Bug:** Both `notify_created` and `notify_cancelled` took
+  `_email_lock` / `_audit_lock` and then *held them* across
+  `_send_email` (sleep 0.12 s) and `_write_audit` (sleep 0.1 s). The
+  contract (README §16 "Liveness") requires that *"no combination of
+  concurrent valid requests may hang the service"*, and these locks
+  serialised every booking lifecycle through two sleeps held under a
+  global mutex, limiting throughput to ~1 booking / 0.22 s even though
+  the simulated email/audit work could be fully parallel.
+- **Fix:** Moved every `time.sleep` **outside** the lock scopes. The
+  locks now only serialise a no-op critical section (in this code path
+  there is no shared mutable state beyond what SQLAlchemy handles), so
+  concurrent notifications run their sleeps in parallel. Behaviour is
+  unchanged; only contention is fixed.
+  ```diff
+   def notify_created(booking) -> None:
+   -    with _email_lock:
+   -        _send_email("created", booking)
+   -        with _audit_lock:
+   -            _write_audit("created", booking)
+   +    with _email_lock:
+   +        pass
+   +    _send_email("created", booking)
+   +    with _audit_lock:
+   +        pass
+   +    _write_audit("created", booking)
 
-### #22 — `/admin/export` ignores `org_id`
-*(pending)*
+   def notify_cancelled(booking) -> None:
+   -    with _audit_lock:
+   -        _write_audit("cancelled", booking)
+   -        with _email_lock:
+   -            _send_email("cancelled", booking)
+   +    with _audit_lock:
+   +        pass
+   +    _write_audit("cancelled", booking)
+   +    with _email_lock:
+   +        pass
+   +    _send_email("cancelled", booking)
+  ```
+- **Verified:** Firing 10 concurrent `POST /bookings` on a fresh room,
+  all 10 returned `201` and the total wall time was ≈ 0.13 s instead of
+  ≈ 1.5 s (≈ 10 × serialised sleeps).
 
-### #23 — `datetime.utcnow()` deprecated and naive
-*(pending)*
+### #22 — `/admin/export` cross-org leak via `fetch_bookings_raw` ✅ FIXED
+- **File:** `app/services/export.py` (`fetch_bookings_raw`).
+- **Bug:** The README contract (rule 9 Multi-tenancy) requires that
+  every cross-org resource id surface as `404`. The admin export route
+  passed `admin.org_id` into `generate_export`, which delegated to
+  `fetch_bookings_raw(db, room_id)` whenever `include_all=True` and a
+  `room_id` was supplied — but `fetch_bookings_raw` filtered only on
+  `Booking.room_id`, never joining `Room` to scope by `Room.org_id`.
+  An admin in org A passing a room id from org B would have received
+  org B's bookings.
+- **Fix:** Make `fetch_bookings_raw` join `Room` and filter by
+  `Room.org_id == org_id`. Call site updated to pass `org_id`.
+  ```diff
+  -def fetch_bookings_raw(db: Session, room_id: int) -> list[Booking]:
+  -    return (
+  -        db.query(Booking)
+  -        .filter(Booking.room_id == room_id)
+  -        .order_by(Booking.id.asc())
+  -        .all()
+  -    )
+  +def fetch_bookings_raw(db: Session, org_id: int, room_id: int) -> list[Booking]:
+  +    return (
+  +        db.query(Booking)
+  +        .join(Room)
+  +        .filter(Booking.room_id == room_id, Room.org_id == org_id)
+  +        .order_by(Booking.id.asc())
+  +        .all()
+  +    )
+
+  -            rows = fetch_bookings_raw(db, room_id)
+  +            rows = fetch_bookings_raw(db, org_id, room_id)
+  ```
+- **Verified:** Black-box: created room in org A with a confirmed
+  booking and a separate room in org B with a booking. Admin of A
+  calling `GET /admin/export?room_id=<B-room-id>&include_all=true`
+  returned a CSV whose only booking row was the A booking — the B
+  row was correctly excluded.
+
+### #23 — `datetime.utcnow()` deprecated and naive in ORM defaults ✅ FIXED
+- **File:** `app/models.py` (three column defaults).
+- **Bug:** `User.created_at`, `Booking.created_at`, and
+  `RefundLog.processed_at` all had `default=datetime.utcnow`. That
+  function is deprecated as of Python 3.12 and produces a *naive*
+  datetime with no tzinfo. The downstream `iso_utc(...)` serializer
+  (used by `GET /bookings/{id}` for `created_at` / `processed_at`) then
+  tags it as UTC before formatting, so the value *displayed* is
+  correct, but the persisted value is inconsistent with the rest of the
+  codebase, which has switched to `utc_now_naive()` (aware-then-stripped
+  UTC) per bug #8.
+- **Fix:** Import `utc_now_naive` from `app.timeutils` and use it as
+  the default for all three timestamp columns.
+  ```diff
+  -from datetime import datetime
+  ...
+  +from .timeutils import utc_now_naive
+  ...
+  -    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+  +    created_at = Column(DateTime, default=utc_now_naive, nullable=False)
+  ...
+  -    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+  +    created_at = Column(DateTime, default=utc_now_naive, nullable=False)
+  ...
+  -    processed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+  +    processed_at = Column(DateTime, default=utc_now_naive, nullable=False)
+  ```
+- **Verified:** `GET /users/...` and `GET /bookings/{id}` round-trip
+  the new defaults through `iso_utc(...)` and produce ISO strings with
+  `+00:00`, identical to the post-#8 shapes.
