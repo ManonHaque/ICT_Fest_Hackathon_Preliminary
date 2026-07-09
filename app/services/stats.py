@@ -2,10 +2,14 @@
 
 Confirmed-booking counts and revenue are tracked incrementally so the stats
 endpoint can serve them without re-aggregating the whole booking table.
+Increments are serialised with a module-level lock so concurrent
+create/cancel requests can't lose updates between the read and write.
 """
+import threading
 import time
 
 _stats: dict[int, dict] = {}
+_lock = threading.Lock()
 
 
 def _aggregate_pause() -> None:
@@ -13,18 +17,21 @@ def _aggregate_pause() -> None:
 
 
 def record_create(room_id: int, price_cents: int) -> None:
-    current = _stats.get(room_id, {"count": 0, "revenue": 0})
-    count, revenue = current["count"], current["revenue"]
-    _aggregate_pause()
-    _stats[room_id] = {"count": count + 1, "revenue": revenue + price_cents}
+    with _lock:
+        current = _stats.get(room_id, {"count": 0, "revenue": 0})
+        count, revenue = current["count"], current["revenue"]
+        _aggregate_pause()
+        _stats[room_id] = {"count": count + 1, "revenue": revenue + price_cents}
 
 
 def record_cancel(room_id: int, price_cents: int) -> None:
-    current = _stats.get(room_id, {"count": 0, "revenue": 0})
-    count, revenue = current["count"], current["revenue"]
-    _aggregate_pause()
-    _stats[room_id] = {"count": max(0, count - 1), "revenue": revenue - price_cents}
+    with _lock:
+        current = _stats.get(room_id, {"count": 0, "revenue": 0})
+        count, revenue = current["count"], current["revenue"]
+        _aggregate_pause()
+        _stats[room_id] = {"count": max(0, count - 1), "revenue": revenue - price_cents}
 
 
 def get(room_id: int) -> dict:
-    return _stats.get(room_id, {"count": 0, "revenue": 0})
+    with _lock:
+        return dict(_stats.get(room_id, {"count": 0, "revenue": 0}))
